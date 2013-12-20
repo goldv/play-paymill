@@ -1,4 +1,4 @@
-name := "paymill"
+name := "play-paymill"
 
 version := "1.0-SNAPSHOT"
 
