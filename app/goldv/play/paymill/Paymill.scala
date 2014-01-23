@@ -1,6 +1,7 @@
 package goldv.play.paymill
 
 import goldv.play.paymill.auth.PaymillCredentials
+import goldv.play.paymill.auth.PaymillAppCredentials
 
 import play.api._
 import play.api.libs.json._
@@ -15,10 +16,13 @@ import play.api.libs.functional.syntax._
 import goldv.play.paymill.model.Transaction._
 import goldv.play.paymill.model._
 
-
 object Paymill {
   
-  case class PaymillError(status: Int, code: Option[Int]){
+  case class PaymillOauthException(error: String, error_description: String) extends Throwable
+  
+  implicit val authExceptionFormat = Json.format[PaymillOauthException] 
+  
+  case class PaymillException(status: Int, code: Option[Int]) extends Throwable{
     val statusDescription = status match{
       case 200 => "ok"
       case 401 => "Unauthorized"
@@ -30,6 +34,7 @@ object Paymill {
     }
     
     val reason = code.map{ 
+      case 100   => "parse error"
       case 10001 => "General undefined response."
       case 10002 => "Still waiting on something."
       case 20000 => "General success response."
@@ -70,56 +75,74 @@ object Paymill {
       case _ => ""
     }
   }
-  
-  val errorWriter = Writes[PaymillError] {
-    case pe => {
-      val status = pe.code.getOrElse(0)
-      Json.obj("status" -> pe.status,
-               "code" -> status,
-               "statusDescription" -> pe.statusDescription,
-               "reason" -> pe.reason)
-    }
-  }
-  
-  implicit val format = Json.reads[PaymillError]
-  
-  def transaction(price: Int, currency: String, params: Map[String,Seq[String]])(implicit credentials: PaymillCredentials): Future[Either[PaymillError, Transaction]] = {
+    
+  def transaction(price: Int, currency: String, params: Map[String,Seq[String]])(implicit credentials: PaymillCredentials): Future[Transaction] = {
     val p = params + ( "amount" -> Seq(price.toString) ) + ("currency" -> Seq(currency))
     val result = WS.url("https://api.paymill.com/v2/transactions")
         .withAuth(credentials.secretKey, "", AuthScheme.BASIC)
         .post(p)
-    result.map{ c => parseResponse[Transaction](c) }
-  }
-  
-  private def parseResponse[T <: PaymillResponse](response: Response)(implicit reader: Reads[T]): Either[PaymillError,T] = {
-    Logger.info(s"paymill s: ${response.status} response: ${response.json.toString}" )
-    // parse json into StripeToken
-    response.status match {
-      case status if(status == 200) => handleStatusSuccess(response.json,status)
-      case status if(status >= 400) => handleStatusError(response.json, status)
-      case status => Left(PaymillError(status, Some(0) ) )
+    
+    result.map{ c => 
+      parseResponse[Transaction](c) match{
+        case Right(t) => t
+        case Left(err) => throw err
+      } 
     }
   }
   
-  private def handleStatusSuccess[T <: PaymillResponse](json: JsValue, status: Int)(implicit reader: Reads[T]): Either[PaymillError,T] = {
+  def token(code: String)(implicit credentials: PaymillCredentials, appCredentials: PaymillAppCredentials): Future[AccessToken] = {
+    val p = Map( ( "grant_type" -> Seq("authorization_code")), 
+                 ("code" -> Seq(code)), 
+                 ("client_id" -> Seq(appCredentials.appId)), 
+                 ("client_secret" -> Seq(appCredentials.clientSecret)) )
+     
+    Logger.info(s"params $p")
+    val result = WS.url("https://connect.paymill.com/token").post(p)
+        
+    result.map{ response =>
+      Logger.info("paymill response " + response.json)
+      parseAccessToken(response) match{
+        case Right(at) => at
+        case Left(err) => throw err
+      }
+    }
+  }
+  
+  private def parseAccessToken(response: Response): Either[PaymillOauthException, AccessToken] = response.status match {
+    case status if(status == 200) => {
+      Json.fromJson[AccessToken](response.json).map{ token => Right(token)}.recoverTotal{ _ =>
+        Left(PaymillOauthException("parse error", s"unable to parse ${response.json}"))
+      }
+    }
+    case _ => {
+      Json.fromJson[PaymillOauthException](response.json).map{ error => Left(error)}.recoverTotal{ err =>
+        Left(PaymillOauthException("parse error", s"unable to parse error ${response.json}"))
+      }
+    }
+  }
+    
+  private def parseResponse[T <: PaymillResponse](response: Response)(implicit reader: Reads[T]): Either[PaymillException,T] = response.status match {
+    case status if(status == 200) => handleStatusSuccess(response.json,status)(reader)
+    case status if(status >= 400) => handleStatusError(response.json, status)(reader)
+    case status => Left(PaymillException(status, Some(0) ) )
+  }
+    
+  private def handleStatusSuccess[T <: PaymillResponse](json: JsValue, status: Int)(implicit reader: Reads[T]): Either[PaymillException,T] = {
     convertJson[T](json){ t =>
       if(t.response_code == 20000) Right(t)
-      else Left( PaymillError(status, Some(t.response_code)) )
+      else Left( PaymillException(status, Some(t.response_code)) )
     }
   }
   
-  private def handleStatusError[T <: PaymillResponse](json: JsValue, status: Int)(implicit reader: Reads[T]): Either[PaymillError,T] = {
+  private def handleStatusError[T <: PaymillResponse](json: JsValue, status: Int)(implicit reader: Reads[T]): Either[PaymillException,T] = {
     convertJson[T](json){ t =>
-      Left(PaymillError(status,Some( t.response_code ) ))
+      Left(PaymillException(status,Some( t.response_code ) ))
     }
   }
-  
-  private def convertJson[T <: PaymillResponse](json: JsValue)(f: T => Either[PaymillError,T])(implicit reader: Reads[T]): Either[PaymillError,T] = {
-    json.asOpt[JsObject].map( _ \ "data").map{ o => 
-      Json.fromJson[T](o).map(f(_)).recoverTotal{ err =>
-        Logger.error(s"unable to parse paymill response: $json error: ${JsError.toFlatJson(err)}")
-        Left(PaymillError(0,None))
-      } 
-    } getOrElse Left(PaymillError(0, None))
+    
+  private def convertJson[T <: PaymillResponse](json: JsValue)(f: T => Either[PaymillException,T])(implicit reader: Reads[T]): Either[PaymillException,T] = {
+    json.asOpt[JsObject].map( _ \ "data").flatMap{ o => 
+      Json.fromJson[T](o).asOpt.map(Right(_))
+    } getOrElse Left(PaymillException(0, Some(100)))
   }
 }

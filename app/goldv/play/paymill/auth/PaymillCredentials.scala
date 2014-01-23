@@ -13,7 +13,7 @@ object PaymillCredentials {
   
   def apply(publishableKey: String, secretKey: String) = SimplePaymillCredentials(publishableKey, secretKey)
   
-  lazy val fromConfiguration: PaymillCredentials = PaymillCredentials(PlayConfiguration("paymill.publishableKey"), PlayConfiguration("paymill.secretKey"))
+  lazy val fromConfiguration: PaymillCredentials = PaymillCredentials(PlayConfiguration.get("paymill.publishableKey"), PlayConfiguration.get("paymill.secretKey"))
   
   implicit def implicitPaymillCredentials:PaymillCredentials = fromConfiguration
 }
