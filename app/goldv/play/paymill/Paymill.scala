@@ -96,11 +96,9 @@ object Paymill {
                  ("client_id" -> Seq(appCredentials.appId)), 
                  ("client_secret" -> Seq(appCredentials.clientSecret)) )
      
-    Logger.info(s"params $p")
     val result = WS.url("https://connect.paymill.com/token").post(p)
         
     result.map{ response =>
-      Logger.info("paymill response " + response.json)
       parseAccessToken(response) match{
         case Right(at) => at
         case Left(err) => throw err
